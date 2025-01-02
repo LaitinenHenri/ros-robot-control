@@ -1,0 +1,494 @@
+#! /usr/bin/env python3
+import sys
+import rospy
+import copy
+import PyKDL 
+import time
+import tf
+import moveit_commander
+import moveit_msgs.msg
+import geometry_msgs.msg
+from geometry_msgs.msg import Pose
+from geometry_msgs.msg import PoseStamped
+import math
+from motion_test_pkg.srv import *
+from tf.transformations import quaternion_from_euler
+import actionlib
+from dual_arm_robot.msg import MotionControlAction, MotionControlActionResult, MotionControlActionFeedback
+
+#INitializing all global stuff
+
+#Initializes moveit_commander
+moveit_commander.roscpp_initialize(sys.argv) 
+robot = moveit_commander.RobotCommander()
+scene = moveit_commander.PlanningSceneInterface()
+arm_left = moveit_commander.MoveGroupCommander("arm_left")
+arm_right = moveit_commander.MoveGroupCommander("arm_right")
+gripper_left = moveit_commander.MoveGroupCommander("gripper1")
+gripper_right = moveit_commander.MoveGroupCommander("gripper2")
+
+#clear all poses
+arm_left.clear_pose_targets()
+arm_right.clear_pose_targets()
+
+    
+robot_arm_list = [(arm_left, gripper_left), (arm_right, gripper_right)]
+robot_name_list = ["robot1", "robot2"]
+
+#set the pitch yaw and roll to approach target box from above
+pitch = 3.14
+roll = 0
+yaw = 0
+
+#Form this thing
+q = quaternion_from_euler(roll, pitch, yaw)
+
+#Setting the mid point as swap point that is used if neede
+swap_pose = geometry_msgs.msg.Pose()
+swap_pose.position.x = 0
+swap_pose.position.y = 0
+swap_pose.position.z = 0.9
+swap_pose.orientation.x = q[0]
+swap_pose.orientation.y = q[1]
+swap_pose.orientation.z = q[2]
+swap_pose.orientation.w = q[3]
+
+#setting target above swapping pose
+above_swap_pose = geometry_msgs.msg.Pose()
+above_swap_pose.position.x = 0
+above_swap_pose.position.y = 0
+above_swap_pose.position.z = 0.95
+above_swap_pose.orientation.x = q[0]
+above_swap_pose.orientation.y = q[1]
+above_swap_pose.orientation.z = q[2]
+above_swap_pose.orientation.w = q[3]
+
+
+
+
+
+def attach_box_to_gripper(robotName):
+    """
+    This function will try to call the attach_release_box service to attach the box to the gripper
+    
+    """
+    rospy.wait_for_service('/scene_spawner/attach_release_box')  # Wait for the box grasping/releasing service
+
+    try:
+        attach_box_service = rospy.ServiceProxy('/scene_spawner/attach_release_box',BoxAttach)
+        
+        
+        attach_request = BoxAttachRequest()
+        attach_request.robot_name = robotName
+        attach_request.box_name = "target"
+        attach_request.attach = True
+
+        attach_responce = attach_box_service(attach_request)
+
+        box_attached_bool = True
+
+
+    except rospy.ServiceException as e:
+        rospy.logerr(f"Service call failed: {e}")
+
+def release_box_to_gripper(robotName):
+    """
+    This function will call the attach_releace service to release the box from the gripper
+    """
+    rospy.wait_for_service('/scene_spawner/attach_release_box')  # Wait for the box grasping/releasing service
+
+    try:
+        attach_box_service = rospy.ServiceProxy('/scene_spawner/attach_release_box',BoxAttach)
+        
+        
+        attach_request = BoxAttachRequest()
+        attach_request.robot_name = robotName
+        attach_request.box_name = "target"
+        attach_request.attach = False
+
+        attach_responce = attach_box_service(attach_request)
+
+        box_attached_bool = True
+
+
+    except rospy.ServiceException as e:
+        rospy.logerr(f"Service call failed: {e}")
+
+
+def request_random_pose_and_spawn():
+    """
+    THis function will call the service generate_random_pose that will generate random x and y for the box
+    Will return floats base_x, base_y, base_z, targetr_X, target_y, target_z
+    These tell the coordinates of base and target boxes
+    """
+    rospy.wait_for_service('generate_random_pose')  # Wait for the random pose service
+    rospy.wait_for_service('/scene_spawner/spawn_box')  # Wait for the box spawning service
+
+    try:
+        # Call the random pose generation service
+        random_pose_service = rospy.ServiceProxy('generate_random_pose', RandomPose)
+        response = random_pose_service()
+
+        pose = response.pose
+        rospy.loginfo(f"Generated random pose: {pose}")
+        
+        # Call the box spawning service with the generated pose
+        spawn_box_service = rospy.ServiceProxy('/scene_spawner/spawn_box', BoxSpawner)
+        
+        box_name = "base"
+        base_request = BoxSpawnerRequest()
+        base_request.name = box_name
+        base_request.x = pose.position.x
+        base_request.y = pose.position.y
+        base_request.z = pose.position.z
+        base_request.base = True  
+    
+
+        
+        spawn_response = spawn_box_service(base_request)
+        if spawn_response.success:
+            rospy.loginfo(f"Box {box_name} spawned successfully!")
+        else:
+            rospy.logerr(f"Failed to spawn box: {spawn_response.message}")
+    
+    
+        responce = random_pose_service()
+        pose_target = responce.pose
+        
+        rospy.loginfo(f"Generated random pose: {pose_target}")
+         
+        target_box_name="target"
+        target_request = BoxSpawnerRequest()
+        target_request.name = target_box_name
+        target_request.x =pose_target.position.x
+        target_request.y =  pose_target.position.y
+        target_request.z = pose_target.position.z
+        target_request.base = False  
+        spawn_response = spawn_box_service(target_request)
+        
+        rospy.loginfo(f"Generated random pose: {target_request.z}")
+        if spawn_response.success:
+            rospy.loginfo(f"Box {box_name} spawned successfully!")
+        else:
+            rospy.logerr(f"Failed to spawn box: {spawn_response.message}")
+        
+        return base_request.x, base_request.y, target_request.x, target_request.y
+        #return 0,0,1
+         
+        
+            
+    except rospy.ServiceException as e:
+        rospy.logerr(f"Service call failed: {e}")
+
+
+def plan_and_execute(moving_part):
+    """
+    This function will plan and execute the trajectory to set target
+    moving_part is robot arm or gripper that has had an target set before calling this function
+    """
+
+    #Setting the plan time to 10 seconds
+    moving_part.set_planning_time(10)
+
+    plan = moving_part.plan()
+
+    if plan[0]:
+        moving_part.execute(plan[1], wait=True)
+    else:
+        print("no solution FOUND!")
+
+def sameSide(robotNum, target, ab_target, base, ab_base):
+    """
+    This function will handel moving the box to the base IF box and base are with in the reach of one robot arm
+    robotNum is the index of the robot witch will execute the moving
+    target is target boxes pose
+    ab_target is pose right above target
+    base is base boxes pose
+    ab_base is pose right above base box
+    """
+    #init feedback
+    feedback = MotionControlActionFeedback()
+   
+    
+    #Setting the right parts for handling
+    #robot arm list has both robotArms and grippers as pairs
+    moving_robot = robot_arm_list[robotNum][0]
+    moving_gripper = robot_arm_list[robotNum][1]
+
+    #moving to above the target, and publising feedback
+    moving_robot.set_pose_target(ab_target)
+    plan_and_execute(moving_robot)
+    feedback.feedback = "Moving robot to target"
+    rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+    server.publish_feedback(feedback)
+
+    #going to the target box and gripping it
+    moving_robot.set_pose_target(target)
+    plan_and_execute(moving_robot)
+
+    moving_gripper.set_named_target("close") 
+    plan_and_execute(moving_gripper)
+    attach_box_to_gripper(robot_name_list[robotNum])
+    feedback.feedback = "target box gripped"
+    rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+    server.publish_feedback(feedback)
+
+    moving_robot.set_pose_target(ab_target)
+    plan_and_execute(moving_robot)
+
+    #moving to above the base
+    moving_robot.set_pose_target(ab_base)
+    plan_and_execute(moving_robot)
+
+    #Moving the attached target box to the base position and releasing it
+    moving_robot.set_pose_target(base)
+    plan_and_execute(moving_robot)
+
+    moving_gripper.set_named_target("open")
+    plan_and_execute(moving_gripper)
+    release_box_to_gripper(robot_name_list[robotNum])
+    feedback.feedback = "Target released on top of base box"
+    rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+    server.publish_feedback(feedback)
+
+    #moving back above the base target
+    moving_robot.set_pose_target(ab_base)
+    plan_and_execute(moving_robot)
+
+    #Moving the robot back to the home position
+    moving_robot.set_named_target("home")
+    plan_and_execute(moving_robot)
+
+def differentSides(robotNum1, robotNum2, target, ab_target, base, ab_base):
+    """
+    This function will handel the moving of the target box to the base pose
+    Will be called if the target and base are in the reach of different robots
+    so an swap will be needed
+    robotNum1 and robotNum2 are the indexes of robots in robot_arm_lsit and robot_name_list
+    robotNum1 is used first then robotNUm2
+    target is target boxes pose
+    ab_target is pose right above target
+    base is base boxes pose
+    ab_base is pose right above base box
+    """
+    #init feedback
+    feedback = MotionControlActionFeedback()
+
+    #Choosing the right robots for this task
+    moving_robot = robot_arm_list[robotNum1][0]
+    moving_gripper = robot_arm_list[robotNum1][1]
+
+    #moving above the target
+    moving_robot.set_pose_target(ab_target)
+    plan_and_execute(moving_robot)
+
+    #Moving arm to the target and attaching box to gripper
+    moving_robot.set_pose_target(target)
+    plan_and_execute(moving_robot)
+    feedback.feedback = "Moving first robot to target box"
+    rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+    server.publish_feedback(feedback)
+
+    moving_gripper.set_named_target("close")
+    plan_and_execute(moving_gripper)
+    attach_box_to_gripper(robot_name_list[robotNum1])
+    feedback.feedback = "Target box gripped"
+    rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+    server.publish_feedback(feedback)
+
+    moving_robot.set_pose_target(ab_target)
+    plan_and_execute(moving_robot)
+
+    #moving robot to above the swap Pose
+    moving_robot.set_pose_target(above_swap_pose)
+    plan_and_execute(moving_robot)
+
+    #Bringing the box to the swap pose
+    moving_robot.set_pose_target(swap_pose)
+    plan_and_execute(moving_robot)
+    moving_gripper.set_named_target("open")
+    plan_and_execute(moving_gripper)
+    release_box_to_gripper(robot_name_list[robotNum1])
+    feedback.feedback = "Target box released at swap position"
+    rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+    server.publish_feedback(feedback)
+
+    #moving robot straight up from swap pose
+    moving_robot.set_pose_target(above_swap_pose)
+    plan_and_execute(moving_robot)
+
+    #oving the first robot back to home position
+    moving_robot.set_named_target("home")
+    plan_and_execute(moving_robot)
+
+    #Setting the second robot as the acctive one
+    moving_robot = robot_arm_list[robotNum2][0]
+    moving_gripper = robot_arm_list[robotNum2][1]
+
+    #moving second arm to above swap pose
+    moving_robot.set_pose_target(above_swap_pose)
+    plan_and_execute(moving_robot)
+
+    #MOving the second robot arm to the swap pose and picking up the target box
+    moving_robot.set_pose_target(swap_pose)
+    plan_and_execute(moving_robot)
+
+    moving_gripper.set_named_target("close") 
+    plan_and_execute(moving_gripper)
+    attach_box_to_gripper(robot_name_list[robotNum2])
+    feedback.feedback = "Target box gripped by second robot at swap position"
+    rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+    server.publish_feedback(feedback)
+
+    #moving to above the base 
+    moving_robot.set_pose_target(ab_base)
+    plan_and_execute(moving_robot)
+
+    #moving the robot to the base position releasing the target box 
+    moving_robot.set_pose_target(base)
+    plan_and_execute(moving_robot)
+
+
+    moving_gripper.set_named_target("open")
+    plan_and_execute(moving_gripper)
+    release_box_to_gripper(robot_name_list[robotNum2])
+    feedback.feedback = "Target box released on top of base box"
+    rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+    server.publish_feedback(feedback)
+
+    #moving back above the box
+    moving_robot.set_pose_target(ab_base)
+    plan_and_execute(moving_robot)
+
+    #Moving the second robot arm back to home position
+    moving_robot.set_named_target("home")
+    plan_and_execute(moving_robot)
+
+
+def running_control(goal):
+    rospy.loginfo("Starting to control robot")
+
+    feedback = MotionControlActionFeedback()
+
+    #release box at the start becouse it is attached for some reason at the beginning???
+    release_box_to_gripper("robot1")
+    release_box_to_gripper("robot2")
+
+
+    #Call the function request_random_pose_and_spawn to get coordinates fron random_pose servicde and spawn poces
+    base_x,base_y, target_x, target_y = request_random_pose_and_spawn()  
+
+
+
+    #Set the desired pose of the target coordinates
+    target_pose = geometry_msgs.msg.Pose()
+    target_pose.position.x = target_x 
+    target_pose.position.y = target_y
+    target_pose.position.z = 0.9 #z is 0.9 so gripper at right level
+    target_pose.orientation.x = q[0]
+    target_pose.orientation.y = q[1]
+    target_pose.orientation.z = q[2]
+    target_pose.orientation.w = q[3]
+
+    #Set the desired pose of above target coordinates
+    above_target_pose = geometry_msgs.msg.Pose()
+    above_target_pose.position.x = target_x 
+    above_target_pose.position.y = target_y
+    above_target_pose.position.z = 0.95 
+    above_target_pose.orientation.x = q[0]
+    above_target_pose.orientation.y = q[1]
+    above_target_pose.orientation.z = q[2]
+    above_target_pose.orientation.w = q[3]
+
+    #Setting the bases coordinates
+    base_pose = geometry_msgs.msg.Pose()
+    base_pose.position.x = base_x
+    base_pose.position.y = base_y
+    base_pose.position.z = 0.95 #z is 0.95 so gripper at right level for above base
+    base_pose.orientation.x = q[0]
+    base_pose.orientation.y = q[1]
+    base_pose.orientation.z = q[2]
+    base_pose.orientation.w = q[3]
+
+    #Setting target above base target
+    above_base_pose = geometry_msgs.msg.Pose()
+    above_base_pose.position.x = base_x
+    above_base_pose.position.y = base_y
+    above_base_pose.position.z = 1.0
+    above_base_pose.orientation.x = q[0]
+    above_base_pose.orientation.y = q[1]
+    above_base_pose.orientation.z = q[2]
+    above_base_pose.orientation.w = q[3]
+
+
+
+    feedback.feedback = "target and base positions generated"
+    rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+    server.publish_feedback(feedback)
+
+
+
+    if target_x > 0 and base_x > 0:
+        #target aand base are within the left arms reach
+
+        #Sending feedback
+        feedback.feedback = "Target and base with in the reach of the left arm"
+        rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+        server.publish_feedback(feedback)
+
+        #Executing robot movements
+        sameSide(0, target_pose, above_target_pose, base_pose, above_base_pose)
+        
+    elif target_x > 0 and base_x < 0:
+        #target in left arms reach, base in right arms reach
+        #Sending feedback
+        feedback.feedback = "target closet to left, base closer to right"
+        rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+        server.publish_feedback(feedback)
+
+        #left moves first then right
+        differentSides(0,1,target_pose, above_target_pose, base_pose, above_base_pose)
+
+        
+    elif target_x < 0 and base_x > 0:
+        #target in right arms reach, base in left arms reach
+        #Sending feedback
+        feedback.feedback = "Target closer to right, base closer to left"
+        rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+        server.publish_feedback(feedback)
+
+        #right moves first then left
+        differentSides(1,0, target_pose, above_target_pose, base_pose, above_base_pose)
+
+    elif target_x < 0 and base_x < 0:
+        #target and base are within the right arm reach
+        #Sending feedback
+        feedback.feedback = "Target and base with in the reach of the right arm"
+        rospy.loginfo(f"Publishing feedback: {feedback.feedback}")
+        server.publish_feedback(feedback)
+
+        #Executing rigth arm movements
+        sameSide(1, target_pose, above_target_pose, base_pose, above_base_pose)
+
+    # Create result
+    result = MotionControlActionResult()
+    result.result = f"Task completed!"
+    rospy.loginfo(f"Action completed: {result.result}")  # Log result before marking as succeeded
+
+    server.set_succeeded(result)  # Mark the action as completed
+
+
+
+def action_server():
+    rospy.init_node('motion_control_action_server')
+    
+    global server
+    # Create an action server
+    server = actionlib.SimpleActionServer('motion_control_act', MotionControlAction, running_control, False)
+    server.start()
+    
+    rospy.loginfo("Action server is ready to receive goals.")
+    rospy.spin()
+
+if __name__ == "__main__":
+    action_server()

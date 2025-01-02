@@ -1,0 +1,54 @@
+#! /usr/bin/env python3
+
+import rospy
+from motion_test_pkg.srv import RandomPose, RandomPoseResponse
+from geometry_msgs.msg import Pose
+import random
+import math
+
+def is_point_valid(x,y):
+        # Distances from the left and right circles
+        # Calculate distances from the centers of the two donuts
+    distance_left = math.sqrt((-0.7 - x)**2 + y**2)
+    distance_right = math.sqrt((0.7 - x)**2 + y**2)
+
+    # Check if the point is within the donut region for either center
+    valid_left = 0.4 < distance_left < 0.9  # Donut on the left
+    valid_right = 0.4 < distance_right < 0.9  # Donut on the right
+
+    # Return True if the point is valid for either region
+    if valid_left or valid_right:
+        return 1
+    else:
+        print("Invalid point!", x, y)
+        return 0
+
+
+
+def handle_random_pose_request(req):
+    # Create a random Pose
+    random_pose = Pose()
+    flag = 1
+    while flag == 1:
+        random_pose.position.x = random.uniform(-1, 1)
+        random_pose.position.y = random.uniform(-1, 1)
+        flag += is_point_valid(random_pose.position.x, random_pose.position.y)
+    random_pose.position.z = 0.7
+    random_pose.orientation.x = 0.0
+    random_pose.orientation.y = 0.0
+    random_pose.orientation.z = 0.0
+    random_pose.orientation.w = 1.0
+
+    rospy.loginfo(f"Generated random pose: {random_pose}")
+    return RandomPoseResponse(random_pose)
+
+def random_pose_server():
+    rospy.init_node('random_pose_server')
+    service = rospy.Service('generate_random_pose', RandomPose, handle_random_pose_request)
+    rospy.loginfo("Random Pose Service Ready")
+    rospy.spin()
+
+if __name__ == "__main__":
+    random_pose_server()
+
+
