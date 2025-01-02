@@ -1,5 +1,8 @@
 # ros-robot-control
 
+**LINK TO DEMO VIDEO**
+https://youtu.be/gcf5WzTC9tU
+
 This is a school project I worked on with Veeti Pekonen and John Bäckström.
 
 **Project Overview**
